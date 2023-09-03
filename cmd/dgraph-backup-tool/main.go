@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"net/http"
 	"os"
 	"time"
 
@@ -27,9 +28,11 @@ func main() {
 	leaseDuration := flag.Duration("leaderelection.lease-duration", 15*time.Second, "LeaderElection lease duration")
 	renewDeadline := flag.Duration("leaderelection.renew-deadline", 10*time.Second, "LeaderElection renew deadline")
 	retryPeriod := flag.Duration("leaderelection.retry-period", 2*time.Second, "LeaderElection retry period")
+
 	flag.Parse()
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	db, err := ydbsdk.Open(ctx, "grpcs://ydb.serverless.yandexcloud.net:2135",
 		ydbenv.WithEnvironCredentials(ctx),
 		ydbsdk.WithDatabase(*ydbDatabaseName),
@@ -72,6 +75,17 @@ func main() {
 	if err := lock.CreateTable(ctx); err != nil {
 		klog.Fatal(err)
 	}
+
+	go func(cancel context.CancelFunc) {
+		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {})
+		if err := http.ListenAndServe(":8081", nil); err != nil {
+			klog.Error(err)
+		}
+
+		klog.Info("http handler finished")
+
+		cancel()
+	}(cancel)
 
 	le.Run(ctx)
 }
