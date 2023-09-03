@@ -1,6 +1,6 @@
 module github.com/sputnik-systems/dgraph-backup-tool
 
-go 1.20
+go 1.21
 
 require (
 	github.com/hasura/go-graphql-client v0.10.0
