@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"time"
@@ -46,6 +48,9 @@ func main() {
 	if err != nil {
 		klog.Fatal(err)
 	}
+	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+
 	lock := ydb.New(db, *ydbTableName, *ydbLeaseName, identity)
 	lec := leaderelection.LeaderElectionConfig{
 		Lock:          lock,
@@ -54,8 +59,6 @@ func main() {
 		RetryPeriod:   *retryPeriod,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
-				secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 				backupLoop(ctx, *dgraphEndpointURL, *dgraphBackupDest, accessKey, secretKey, *dgraphBackupPeriod)
 			},
 			OnStoppedLeading: func() {
@@ -76,16 +79,7 @@ func main() {
 		klog.Fatal(err)
 	}
 
-	go func(cancel context.CancelFunc) {
-		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {})
-		if err := http.ListenAndServe(":8081", nil); err != nil {
-			klog.Error(err)
-		}
-
-		klog.Info("http handler finished")
-
-		cancel()
-	}(cancel)
+	go apiHandler(ctx, cancel, *dgraphEndpointURL, *dgraphBackupDest, accessKey, secretKey)
 
 	le.Run(ctx)
 }
@@ -93,7 +87,7 @@ func main() {
 func backupLoop(ctx context.Context, endpoint, dest, accessKey, secretKey string, period time.Duration) {
 	klog.V(3).Info("started backup loop")
 
-	b, err := backup.NewClient(endpoint, dest,
+	c, err := backup.NewClient(endpoint, dest,
 		backup.WithAccessKey(accessKey),
 		backup.WithSecretKey(secretKey),
 	)
@@ -106,7 +100,7 @@ func backupLoop(ctx context.Context, endpoint, dest, accessKey, secretKey string
 		case <-ticker.C:
 			klog.Info("make backup export request")
 
-			resp, err := b.Export(ctx)
+			resp, err := c.Export(ctx)
 			if err != nil {
 				klog.Error(err)
 				continue
@@ -115,6 +109,49 @@ func backupLoop(ctx context.Context, endpoint, dest, accessKey, secretKey string
 			klog.Infof("exported files: %v", resp.GetFiles())
 		case <-ctx.Done():
 			return
+		}
+	}
+}
+
+func apiHandler(ctx context.Context, cancel context.CancelFunc, endpoint, dest, accessKey, secretKey string) {
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {})
+	http.HandleFunc("/api/v1/export", apiExportHandler(ctx, endpoint, dest, accessKey, secretKey))
+	if err := http.ListenAndServe(":8081", nil); err != nil {
+		klog.Error(err)
+	}
+
+	klog.Info("http handler finished")
+
+	cancel()
+}
+
+func apiExportHandler(ctx context.Context, endpoint, dest, accessKey, secretKey string) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			c, err := backup.NewClient(endpoint, dest,
+				backup.WithAccessKey(accessKey),
+				backup.WithSecretKey(secretKey),
+			)
+			if err != nil {
+				fmt.Fprintln(w, err.Error())
+				return
+			}
+			resp, err := c.Export(ctx)
+			if err != nil {
+				fmt.Fprintln(w, err.Error())
+				return
+			}
+
+			b, err := json.Marshal(resp)
+			if err != nil {
+				fmt.Fprintln(w, err.Error())
+				return
+			}
+
+			fmt.Fprintln(w, string(b))
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	}
 }
