@@ -1,4 +1,4 @@
-module github.com/sputnik-systems/dgraph-backup-tool
+module github.com/sputnik-systems/dgraph-export-tool
 
 go 1.21
 
