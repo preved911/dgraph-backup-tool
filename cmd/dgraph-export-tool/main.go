@@ -26,7 +26,7 @@ func main() {
 	dgraphExportDest := flag.String("dgraph.export-dest", "", "Dgraph export export destination url")
 	dgraphExportPeriod := flag.Duration("dgraph.export-period", time.Hour, "Dgraph export period")
 	dgraphExportTmpPrefix := flag.String("dgraph.export-tmp-prefix", "/tmp", "Dgraph export temporary dir prefix")
-	dgraphExportTmpPattern := flag.String("dgraph.export-tmp-pattern", `export[0-9]+`, "Dgraph export temporary files name pattern")
+	dgraphExportTmpPattern := flag.String("dgraph.export-tmp-pattern", `export[0-9]*`, "Dgraph export temporary files name pattern")
 	dgraphExportTmpCleanup := flag.Bool("dgraph.export-tmp-cleanup", false, "Dgraph export temporary dir cleanup")
 	ydbDatabaseName := flag.String("ydb.database-name", "", "YDB database name for init connection")
 	ydbTableName := flag.String("ydb.table-name", "", "YDB table name")
