@@ -2,7 +2,7 @@ release:
   name_template: "{{ .ProjectName }} v{{ .Version }}"
 
 builds:
-  - main: ./cmd/dgraph-backup-tool
+  - main: ./cmd/dgraph-export-tool
     env:
       - CGO_ENABLED=0
     goos:
