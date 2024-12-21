@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/preved911/resourcelock/ydb"
@@ -15,15 +16,18 @@ import (
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/klog"
 
-	"github.com/sputnik-systems/dgraph-backup-tool/internal/dgraph/backup"
+	"github.com/sputnik-systems/dgraph-export-tool/internal/dgraph/export"
 )
 
 func main() {
 	klog.InitFlags(nil)
 
 	dgraphEndpointURL := flag.String("dgraph.endpoint-url", "http://localhost:8080/admin", "Dgraph instance admin endpoint")
-	dgraphBackupDest := flag.String("dgraph.backup-dest", "", "Dgraph backup export destination url")
-	dgraphBackupPeriod := flag.Duration("dgraph.backup-period", time.Hour, "Dgraph backup period")
+	dgraphExportDest := flag.String("dgraph.export-dest", "", "Dgraph export export destination url")
+	dgraphExportPeriod := flag.Duration("dgraph.export-period", time.Hour, "Dgraph export period")
+	dgraphExportTmpPrefix := flag.String("dgraph.export-tmp-prefix", "/tmp", "Dgraph export temporary dir prefix")
+	dgraphExportTmpPattern := flag.String("dgraph.export-tmp-pattern", `export[0-9]*`, "Dgraph export temporary files name pattern")
+	dgraphExportTmpCleanup := flag.Bool("dgraph.export-tmp-cleanup", false, "Dgraph export temporary dir cleanup")
 	ydbDatabaseName := flag.String("ydb.database-name", "", "YDB database name for init connection")
 	ydbTableName := flag.String("ydb.table-name", "", "YDB table name")
 	ydbLeaseName := flag.String("ydb.lease-name", "", "YDB lease name")
@@ -32,6 +36,19 @@ func main() {
 	retryPeriod := flag.Duration("leaderelection.retry-period", 2*time.Second, "LeaderElection retry period")
 
 	flag.Parse()
+
+	params := dgraphParams{
+		endpoint:  *dgraphEndpointURL,
+		dest:      *dgraphExportDest,
+		accessKey: os.Getenv("AWS_ACCESS_KEY_ID"),
+		secretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		period:    *dgraphExportPeriod,
+		dgraphTmp: dgraphTmp{
+			prefix:  *dgraphExportTmpPrefix,
+			pattern: *dgraphExportTmpPattern,
+			cleanup: *dgraphExportTmpCleanup,
+		},
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -48,8 +65,6 @@ func main() {
 	if err != nil {
 		klog.Fatal(err)
 	}
-	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
-	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 
 	lock := ydb.New(db, *ydbTableName, *ydbLeaseName, identity)
 	lec := leaderelection.LeaderElectionConfig{
@@ -59,7 +74,7 @@ func main() {
 		RetryPeriod:   *retryPeriod,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				backupLoop(ctx, *dgraphEndpointURL, *dgraphBackupDest, accessKey, secretKey, *dgraphBackupPeriod)
+				params.exportLoop(ctx)
 			},
 			OnStoppedLeading: func() {
 				klog.V(3).Infof("stopped leading")
@@ -68,7 +83,7 @@ func main() {
 				klog.Infof("%s is leader now", identity)
 			},
 		},
-		Name: "Dgraph Backup Tool",
+		Name: "Dgraph Export Tool",
 	}
 	le, err := leaderelection.NewLeaderElector(lec)
 	if err != nil {
@@ -79,26 +94,41 @@ func main() {
 		klog.Fatal(err)
 	}
 
-	go apiHandler(ctx, cancel, *dgraphEndpointURL, *dgraphBackupDest, accessKey, secretKey)
+	go params.apiHandler(ctx, cancel)
 
 	le.Run(ctx)
 }
 
-func backupLoop(ctx context.Context, endpoint, dest, accessKey, secretKey string, period time.Duration) {
-	klog.V(3).Info("started backup loop")
+type dgraphParams struct {
+	endpoint  string
+	dest      string
+	accessKey string
+	secretKey string
+	period    time.Duration
+	dgraphTmp
+}
 
-	c, err := backup.NewClient(endpoint, dest,
-		backup.WithAccessKey(accessKey),
-		backup.WithSecretKey(secretKey),
+type dgraphTmp struct {
+	prefix  string
+	pattern string
+	cleanup bool
+}
+
+func (p *dgraphParams) exportLoop(ctx context.Context) {
+	klog.V(3).Info("started export loop")
+
+	c, err := export.NewClient(p.endpoint, p.dest,
+		export.WithAccessKey(p.accessKey),
+		export.WithSecretKey(p.secretKey),
 	)
 	if err != nil {
 		klog.Fatal(err)
 	}
 
-	for ticker := time.NewTicker(period); ; {
+	for ticker := time.NewTicker(p.period); ; {
 		select {
 		case <-ticker.C:
-			klog.Info("make backup export request")
+			klog.Info("make export export request")
 
 			resp, err := c.Export(ctx)
 			if err != nil {
@@ -107,15 +137,21 @@ func backupLoop(ctx context.Context, endpoint, dest, accessKey, secretKey string
 			}
 
 			klog.Infof("exported files: %v", resp.GetFiles())
+
+			if p.dgraphTmp.cleanup {
+				if err := cleanupTmpFiles(ctx, p.dgraphTmp.prefix, p.dgraphTmp.pattern); err != nil {
+					klog.Error(err)
+				}
+			}
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func apiHandler(ctx context.Context, cancel context.CancelFunc, endpoint, dest, accessKey, secretKey string) {
+func (p *dgraphParams) apiHandler(ctx context.Context, cancel context.CancelFunc) {
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {})
-	http.HandleFunc("/api/v1/export", apiExportHandler(ctx, endpoint, dest, accessKey, secretKey))
+	http.HandleFunc("/api/v1/export", p.apiExportHandler(ctx))
 	if err := http.ListenAndServe(":8081", nil); err != nil {
 		klog.Error(err)
 	}
@@ -125,13 +161,13 @@ func apiHandler(ctx context.Context, cancel context.CancelFunc, endpoint, dest, 
 	cancel()
 }
 
-func apiExportHandler(ctx context.Context, endpoint, dest, accessKey, secretKey string) func(w http.ResponseWriter, r *http.Request) {
+func (p *dgraphParams) apiExportHandler(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
-			c, err := backup.NewClient(endpoint, dest,
-				backup.WithAccessKey(accessKey),
-				backup.WithSecretKey(secretKey),
+			c, err := export.NewClient(p.endpoint, p.dest,
+				export.WithAccessKey(p.accessKey),
+				export.WithSecretKey(p.secretKey),
 			)
 			if err != nil {
 				fmt.Fprintln(w, err.Error())
@@ -153,5 +189,34 @@ func apiExportHandler(ctx context.Context, endpoint, dest, accessKey, secretKey 
 		default:
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
+
+		if p.dgraphTmp.cleanup {
+			if err := cleanupTmpFiles(ctx, p.dgraphTmp.prefix, p.dgraphTmp.pattern); err != nil {
+				klog.Error(err)
+			}
+		}
 	}
+}
+
+func cleanupTmpFiles(ctx context.Context, prefix, pattern string) error {
+	entries, err := os.ReadDir(prefix)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		match, err := filepath.Match(pattern, entry.Name())
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() && match {
+			path := filepath.Join(prefix, entry.Name())
+			klog.Infof("removing directory: %s", path)
+			if err := os.RemoveAll(path); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
